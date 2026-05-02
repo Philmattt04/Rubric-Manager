@@ -1,0 +1,23 @@
+resource "aws_route53_record" "web_ipv4" {
+  zone_id = data.aws_route53_zone.root.zone_id
+  name    = var.domain
+  type    = "A"
+
+  alias {
+    name                   = aws_cloudfront_distribution.web.domain_name
+    zone_id                = aws_cloudfront_distribution.web.hosted_zone_id
+    evaluate_target_health = false
+  }
+}
+
+resource "aws_route53_record" "web_ipv6" {
+  zone_id = data.aws_route53_zone.root.zone_id
+  name    = var.domain
+  type    = "AAAA"
+
+  alias {
+    name                   = aws_cloudfront_distribution.web.domain_name
+    zone_id                = aws_cloudfront_distribution.web.hosted_zone_id
+    evaluate_target_health = false
+  }
+}
