@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -7,8 +8,8 @@ import '../config/aws_config.dart';
 import '../main.dart';
 import '../services/audio_converter.dart';
 import '../services/s3_service.dart';
-import 'package:desktop_drop/desktop_drop.dart';
 import '../utils/download_helper.dart';
+import '../utils/drop_helper.dart';
 import 'login_screen.dart';
 
 class UploadScreen extends StatefulWidget {
@@ -27,7 +28,9 @@ class _UploadScreenState extends State<UploadScreen> {
   int _rubricFileCount = 0;
   String _rubricKeyPrefix = '';
   List<PlatformFile?> _selectedFiles = [];
+  List<GlobalKey> _slotKeys = [];
   int? _dragOverIndex;
+  Timer? _dragEndTimer;
 
   // ── Upload state ──────────────────────────────────────────────────
   bool _isUploading = false;
@@ -50,10 +53,39 @@ class _UploadScreenState extends State<UploadScreen> {
     );
     _dateController = TextEditingController(text: _formatDate(_selectedDate));
     _loadRubrics();
+    registerDropListeners(
+      onDrop: (x, y, name, bytes) {
+        _dragEndTimer?.cancel();
+        _dragEndTimer = null;
+        final index = _hitTestSlots(x, y);
+        if (index == null || _isUploading || !mounted) return;
+        setState(() {
+          _selectedFiles[index] = PlatformFile(
+            name: name,
+            size: bytes.length,
+            bytes: bytes,
+          );
+          _dragOverIndex = null;
+          _uploadStatus = null;
+        });
+      },
+      onDragMove: (x, y) {
+        if (!mounted) return;
+        _dragEndTimer?.cancel();
+        _dragEndTimer = Timer(const Duration(milliseconds: 300), () {
+          if (mounted) setState(() => _dragOverIndex = null);
+        });
+        final index = _hitTestSlots(x, y);
+        if (index != _dragOverIndex) setState(() => _dragOverIndex = index);
+      },
+      onDragLeave: () {},
+    );
   }
 
   @override
   void dispose() {
+    _dragEndTimer?.cancel();
+    unregisterDropListeners();
     _dateController.dispose();
     super.dispose();
   }
@@ -115,17 +147,36 @@ class _UploadScreenState extends State<UploadScreen> {
       _rubricFileCount = count;
       _rubricKeyPrefix = keyPrefix;
       _selectedFiles = List.filled(count, null);
+      _slotKeys = List.generate(count, (_) => GlobalKey());
       _uploadStatus = null;
       _uploadSuccess = false;
       _uploadedFiles = [];
     });
   }
 
+  int? _hitTestSlots(int clientX, int clientY) {
+    final cursor = Offset(clientX.toDouble(), clientY.toDouble());
+    for (int i = 0; i < _slotKeys.length; i++) {
+      final ctx = _slotKeys[i].currentContext;
+      if (ctx == null) continue;
+      final box = ctx.findRenderObject() as RenderBox?;
+      if (box == null || !box.hasSize) continue;
+      if ((box.localToGlobal(Offset.zero) & box.size).contains(cursor)) {
+        return i;
+      }
+    }
+    return null;
+  }
+
   // ── Upload ────────────────────────────────────────────────────────
 
   Future<void> _pickFile(int index) async {
     final result = await FilePicker.platform.pickFiles(
-      type: FileType.audio,
+      type: FileType.custom,
+      allowedExtensions: [
+        ...AudioConverter.audioFormats,
+        ...AudioConverter.videoFormats,
+      ],
       allowMultiple: false,
       withData: true,
     );
@@ -135,22 +186,6 @@ class _UploadScreenState extends State<UploadScreen> {
         _uploadStatus = null;
       });
     }
-  }
-
-  Future<void> _onFileDrop(int index, DropDoneDetails details) async {
-    if (details.files.isEmpty || _isUploading) return;
-    final xFile = details.files.first;
-    final bytes = await xFile.readAsBytes();
-    final name = xFile.name;
-    setState(() {
-      _selectedFiles[index] = PlatformFile(
-        name: name,
-        size: bytes.length,
-        bytes: bytes,
-      );
-      _dragOverIndex = null;
-      _uploadStatus = null;
-    });
   }
 
   bool get _canUpload =>
@@ -183,55 +218,82 @@ class _UploadScreenState extends State<UploadScreen> {
     });
 
     try {
-      final uploadedKeys = <String>[];
-      for (final entry in slots) {
-        final index = entry.key;
-        final file = entry.value!;
-        final originalExt = file.extension ?? '';
-        final targetExt = _targetFormat ?? originalExt;
-        var bytes = Uint8List.fromList(file.bytes!);
+      if (_targetFormat != null) {
+        // Conversion requested — convert and download locally, skip S3
+        for (final entry in slots) {
+          final index = entry.key;
+          final file = entry.value!;
+          final originalExt = file.extension ?? '';
+          final targetExt = _targetFormat!;
+          var bytes = Uint8List.fromList(file.bytes!);
 
-        if (_targetFormat != null && _targetFormat != originalExt) {
-          setState(() => _uploadStatus = 'Loading converter…');
-          bytes = await AudioConverter.convert(
-            bytes: bytes,
-            fromExt: originalExt,
-            toExt: targetExt,
-            onProgress: (ratio) =>
-                setState(() => _conversionProgress = ratio.clamp(0.0, 1.0)),
+          setState(() => _uploadStatus =
+              'Converting file ${index + 1} of ${slots.length}…');
+          if (targetExt != originalExt) {
+            bytes = await AudioConverter.convert(
+              bytes: bytes,
+              fromExt: originalExt,
+              toExt: targetExt,
+              onProgress: (ratio) =>
+                  setState(() => _conversionProgress = ratio.clamp(0.0, 1.0)),
+            );
+            setState(() => _conversionProgress = null);
+          }
+
+          final s3Name = _s3.buildFileName(
+            targetExt,
+            _selectedDate,
+            keyPrefix: _rubricKeyPrefix,
+            fileIndex: _rubricFileCount > 1 ? index + 1 : null,
           );
-          setState(() => _conversionProgress = null);
+          downloadBytes(bytes, s3Name.split('/').last);
         }
 
-        setState(() =>
-            _uploadStatus = 'Uploading file ${index + 1} of ${slots.length}…');
-        final s3Name = _s3.buildFileName(
-          targetExt,
-          _selectedDate,
-          keyPrefix: _rubricKeyPrefix,
-          fileIndex: _rubricFileCount > 1 ? index + 1 : null,
-        );
-        await _s3.uploadFile(bytes: bytes, fileName: s3Name);
-        uploadedKeys.add(s3Name);
-      }
+        setState(() {
+          _uploadSuccess = true;
+          _uploadStatus = 'Conversion complete — file(s) downloaded';
+          _selectedFiles = List.filled(_rubricFileCount, null);
+          _uploadedFiles = [];
+        });
+      } else {
+        // No conversion — upload to S3 as normal
+        final uploadedKeys = <String>[];
+        for (final entry in slots) {
+          final index = entry.key;
+          final file = entry.value!;
+          final originalExt = file.extension ?? '';
+          var bytes = Uint8List.fromList(file.bytes!);
 
-      setState(() => _uploadStatus = 'Generating download links…');
-      final links = <({String name, String url})>[];
-      for (final key in uploadedKeys) {
-        final url = await _s3.presignedDownloadUrl(key);
-        links.add((name: key.split('/').last, url: url));
-      }
+          setState(() => _uploadStatus =
+              'Uploading file ${index + 1} of ${slots.length}…');
+          final s3Name = _s3.buildFileName(
+            originalExt,
+            _selectedDate,
+            keyPrefix: _rubricKeyPrefix,
+            fileIndex: _rubricFileCount > 1 ? index + 1 : null,
+          );
+          await _s3.uploadFile(bytes: bytes, fileName: s3Name);
+          uploadedKeys.add(s3Name);
+        }
 
-      setState(() {
-        _uploadSuccess = true;
-        _uploadStatus = 'Upload complete';
-        _selectedFiles = List.filled(_rubricFileCount, null);
-        _uploadedFiles = links;
-      });
+        setState(() => _uploadStatus = 'Generating download links…');
+        final links = <({String name, String url})>[];
+        for (final key in uploadedKeys) {
+          final url = await _s3.presignedDownloadUrl(key);
+          links.add((name: key.split('/').last, url: url));
+        }
+
+        setState(() {
+          _uploadSuccess = true;
+          _uploadStatus = 'Upload complete';
+          _selectedFiles = List.filled(_rubricFileCount, null);
+          _uploadedFiles = links;
+        });
+      }
     } catch (e) {
       setState(() {
         _uploadSuccess = false;
-        _uploadStatus = 'Upload failed: $e';
+        _uploadStatus = 'Failed: $e';
       });
     } finally {
       setState(() {
@@ -336,12 +398,8 @@ class _UploadScreenState extends State<UploadScreen> {
                               ?.copyWith(color: cs.primary),
                         ),
                       ),
-                    DropTarget(
-                      onDragDone: (d) => _onFileDrop(i, d),
-                      onDragEntered: (_) =>
-                          setState(() => _dragOverIndex = i),
-                      onDragExited: (_) =>
-                          setState(() => _dragOverIndex = null),
+                    Container(
+                      key: _slotKeys[i],
                       child: _FilePicker(
                         file: _selectedFiles[i],
                         enabled: !_isUploading,
@@ -366,8 +424,20 @@ class _UploadScreenState extends State<UploadScreen> {
                     dropdownMenuEntries: [
                       const DropdownMenuEntry(
                           value: 'original', label: 'Keep original'),
-                      ...AudioConverter.formats.map((f) =>
-                          DropdownMenuEntry(value: f, label: f.toUpperCase())),
+                      ...AudioConverter.audioFormats.map((f) =>
+                          DropdownMenuEntry(
+                            value: f,
+                            label: f.toUpperCase(),
+                            leadingIcon: const Icon(Icons.audio_file_outlined,
+                                size: 16),
+                          )),
+                      ...AudioConverter.videoFormats.map((f) =>
+                          DropdownMenuEntry(
+                            value: f,
+                            label: f.toUpperCase(),
+                            leadingIcon: const Icon(Icons.video_file_outlined,
+                                size: 16),
+                          )),
                     ],
                   ),
                 if (kIsWeb) const SizedBox(height: 16),
@@ -528,12 +598,12 @@ class _FilePicker extends StatelessWidget {
                           size: 44,
                           color: cs.onSurface.withValues(alpha: 0.6)),
                       const SizedBox(height: 10),
-                      Text('Click or drop an audio file',
+                      Text('Click or drop a media file',
                           style: TextStyle(
                               color: cs.onSurface.withValues(alpha: 0.5),
                               fontSize: 15)),
                       const SizedBox(height: 4),
-                      Text('MP3, WAV, AAC, OGG…',
+                      Text('Audio: MP3, WAV, AAC… · Video: MP4, MOV, WEBM…',
                           style: TextStyle(
                               color: cs.onSurface.withValues(alpha: 0.3),
                               fontSize: 12)),

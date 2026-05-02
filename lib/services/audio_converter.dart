@@ -2,10 +2,52 @@ import 'dart:typed_data';
 import 'package:ffmpeg_wasm/ffmpeg_wasm.dart';
 
 class AudioConverter {
-  static const List<String> formats = ['mp3', 'wav', 'aac', 'ogg', 'flac', 'm4a'];
+  static const List<String> audioFormats = [
+    'mp3', 'wav', 'aac', 'ogg', 'flac', 'm4a',
+  ];
+
+  static const List<String> videoFormats = [
+    'mp4', 'webm', 'mov', 'avi', 'mkv',
+  ];
+
+  /// All supported formats (audio + video).
+  static const List<String> formats = [...audioFormats, ...videoFormats];
 
   static const String _corePath =
       'https://unpkg.com/@ffmpeg/core-st@0.11.1/dist/ffmpeg-core.js';
+
+  static bool _isVideo(String ext) =>
+      videoFormats.contains(ext.toLowerCase());
+
+  /// Builds FFmpeg arguments based on the source and target media types.
+  static List<String> _buildArgs(
+      String input, String output, String fromExt, String toExt) {
+    final fromVideo = _isVideo(fromExt);
+    final toVideo = _isVideo(toExt);
+
+    if (fromVideo && !toVideo) {
+      // Video → Audio: strip the video track, keep audio stream.
+      return ['-i', input, '-vn', '-y', output];
+    }
+
+    if (!fromVideo && toVideo) {
+      // Audio → Video: pair audio with a 640×480 black background.
+      final useVpx = toExt == 'webm';
+      return [
+        '-f', 'lavfi',
+        '-i', 'color=black:s=640x480:r=25',
+        '-i', input,
+        '-c:v', useVpx ? 'libvpx' : 'libx264',
+        if (!useVpx) ...const ['-pix_fmt', 'yuv420p'],
+        '-c:a', useVpx ? 'libvorbis' : 'aac',
+        '-shortest', '-y',
+        output,
+      ];
+    }
+
+    // Audio→Audio or Video→Video: let FFmpeg auto-select codecs.
+    return ['-i', input, '-y', output];
+  }
 
   static Future<FFmpeg> _createAndLoad() async {
     final ffmpeg = createFFmpeg(CreateFFmpegParam(
@@ -17,10 +59,6 @@ class AudioConverter {
     return ffmpeg;
   }
 
-  /// Converts [bytes] from [fromExt] to [toExt].
-  ///
-  /// A fresh FFmpeg instance is created and destroyed for every call so
-  /// the wasm "running" flag is always clean between conversions.
   static Future<Uint8List> convert({
     required Uint8List bytes,
     required String fromExt,
@@ -34,17 +72,14 @@ class AudioConverter {
         ffmpeg.setProgress((p) => onProgress(p.ratio));
       }
 
-      final inputFile = 'input.$fromExt';
-      final outputFile = 'output.$toExt';
+      final inputFile = 'input.${fromExt.toLowerCase()}';
+      final outputFile = 'output.${toExt.toLowerCase()}';
 
       ffmpeg.writeFile(inputFile, bytes);
-      await ffmpeg.run(['-i', inputFile, '-y', outputFile]);
-      final result = ffmpeg.readFile(outputFile);
-
-      return result;
+      await ffmpeg.run(
+          _buildArgs(inputFile, outputFile, fromExt.toLowerCase(), toExt.toLowerCase()));
+      return ffmpeg.readFile(outputFile);
     } finally {
-      // exit() resets the internal JS running flag and frees MEMFS.
-      // The browser caches the wasm binary so the next load() is fast.
       try {
         ffmpeg.exit();
       } catch (_) {}
